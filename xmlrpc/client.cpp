@@ -7,7 +7,6 @@
 
 #include <qhttp.h>
 #include <qbuffer.h>
-#include <QtNetwork>
 #include <QAuthenticator>
 
 //#define XMLRPC_DEBUG
@@ -17,21 +16,20 @@ namespace  xmlrpc {
 class Client::Private
 {
 public:
+    QUrl url;
     QString hostName;
     quint16 port;
     QString path;
+    bool useSSL;
 
     QString userName;
     QString password;
 
     QString userAgent;
 
-    QHttp *http;
+    QNetworkAccessManager *accessManager;
 
     QAuthenticator proxyAuth;
-
-    QMap<int,QBuffer*> serverResponses;
-    QMap<int, QString> methodNames; // id->methodNames
 };
 
 /**
@@ -44,31 +42,53 @@ Client::Client(QObject * parent)
     d->port = 0;
     d->path = "/";
     d->userAgent = "QXMLRPC";
-    d->http = new QHttp(this);
+    d->useSSL = false;
 
-    connect( d->http, SIGNAL(requestFinished(int,bool)), SLOT(requestFinished(int,bool)) );
+    d->accessManager = new QNetworkAccessManager(this);
 
-    connect( d->http, SIGNAL(proxyAuthenticationRequired(const QNetworkProxy &, QAuthenticator *)),
+    connect( d->accessManager, SIGNAL( finished(QNetworkReply * ) ), SLOT( finished(QNetworkReply *) ) );
+
+    connect( d->accessManager, SIGNAL(proxyAuthenticationRequired(const QNetworkProxy &, QAuthenticator *)),
              this, SIGNAL(proxyAuthenticationRequired(const QNetworkProxy &, QAuthenticator *) ) );
 
-    connect( d->http, SIGNAL( authenticationRequired ( const QString &, quint16, QAuthenticator * ) ),
-             this, SIGNAL( authenticationRequired ( const QString &, quint16, QAuthenticator * ) ) );
+    connect( d->accessManager, SIGNAL( authenticationRequired ( QNetworkReply *, QAuthenticator * ) ),
+             this, SIGNAL( authenticationRequired ( QNetworkReply *, QAuthenticator * ) ) );
+
+    connect( d->accessManager, SIGNAL( networkAccessibleChanged(QNetworkAccessManager::NetworkAccessibility ) ),
+             this, SIGNAL( networkAccessibleChanged(QNetworkAccessManager::NetworkAccessibility)));
+
+    connect( d->accessManager, SIGNAL( sslErrors(QNetworkReply*,QList<QSslError>)),
+             this, SIGNAL(sslError(QNetworkReply*,QList<QSslError>)));
 }
 
 /**
  * Constructs a XmlRPC client for communication with XmlRPC
  * server running on host \a hostName \a port.
  */
-Client::Client(const QString & hostName, quint16 port, QObject * parent)
+Client::Client(const QString & hostName, quint16 port,  QObject * parent)
 : QObject( parent )
 {
     d = new Private;
     setHost( hostName, port );
 
+    d->userAgent = "QXMLRPC";
+
     //important: dissconnect all connection from http in destructor,
     //otherwise crashes are possible when other parts of Client::Private
     //is deleted before http
-    connect( d->http, SIGNAL(requestFinished(int,bool)), SLOT(requestFinished(int,bool)) );
+    connect( d->accessManager, SIGNAL( finished(QNetworkReply * ) ), SLOT( finished(QNetworkReply *) ) );
+
+    connect( d->accessManager, SIGNAL(proxyAuthenticationRequired(const QNetworkProxy &, QAuthenticator *)),
+             this, SIGNAL(proxyAuthenticationRequired(const QNetworkProxy &, QAuthenticator *) ) );
+
+    connect( d->accessManager, SIGNAL( authenticationRequired ( QNetworkReply *, QAuthenticator * ) ),
+             this, SIGNAL( authenticationRequired ( QNetworkReply *, QAuthenticator * ) ) );
+
+    connect( d->accessManager, SIGNAL( networkAccessibleChanged(QNetworkAccessManager::NetworkAccessibility ) ),
+             this, SIGNAL( networkAccessibleChanged(QNetworkAccessManager::NetworkAccessibility)));
+
+    connect( d->accessManager, SIGNAL( sslErrors(QNetworkReply*,QList<QSslError>)),
+             this, SIGNAL(sslError(QNetworkReply*,QList<QSslError>)));
 }
 
 /**
@@ -78,7 +98,7 @@ Client::~Client()
 {
     // it's necessary to delete QHttp instance before Private instance
     // to be sure Client slots will not be called with already deleted Private data
-    delete d->http;
+    delete d->accessManager;
     qDeleteAll( d->serverResponses );
     delete d;
 }
@@ -88,12 +108,12 @@ Client::~Client()
  * Sets the XML-RPC server that is used for requests to hostName
  * on port \a port and path \path.
  */
-void Client::setHost( const QString & hostName, quint16 port, QString path )
+void Client::setHost( const QString & hostName, quint16 port, QString path, bool useSSL )
 {
     d->hostName = hostName;
     d->port = port;
     d->path = path;
-    d->http->setHost( hostName, port );
+    d->useSSL = useSSL;
 }
 
 /**
@@ -101,28 +121,14 @@ void Client::setHost( const QString & hostName, quint16 port, QString path )
  * username and password can be provided if the proxy server
  * requires authentication.
  */
-void Client::setProxy( const QString & host, int port, 
-                    const QString & userName, const QString & password )
+void Client::setProxy( const QNetworkProxy &proxy )
 {
 
 #ifdef XMLRPC_DEBUG
     qDebug() << "xmlrpc client: set proxy" << host << port << userName << password;
 #endif
 
-    d->http->setProxy( host, port, userName, password );
-}
-
-/**
- * Replaces the internal QTcpSocket that QHttp uses with socket.
- * This can be useful for adding https support with QtSslSocket.
- * 
- * Check
- * \l{http://trolltech.com/products/qt/addon/solutions/catalog/4/Utilities/qtsslsocket/}
- * and QHttp::setSocket() for more information.
- */
-void Client::setSocket( QTcpSocket * socket )
-{
-    d->http->setSocket( socket );
+    d->accessManager->setProxy(proxy);
 }
 
 /**
@@ -131,9 +137,13 @@ void Client::setSocket( QTcpSocket * socket )
  */
 void Client::setUser( const QString & userName, const QString & password )
 {
-    //d->http->setUser( userName, password );
     d->userName = userName;
     d->password = password;
+}
+
+void Client::setUrl(const QUrl & url)
+{
+    d->url = url;
 }
 
 /**
@@ -164,12 +174,28 @@ void Client::setUserAgent( const QString & userAgent )
  * but to avoid such kind of bugs, the parameters order in
  * overloaded methods was changed.
  */
-int Client::request( QList<Variant> params, QString methodName )
+void Client::request( QList<Variant> params, QString methodName )
 {
     QBuffer *outBuffer = new QBuffer;
 
+    //TODO: Save data until finished slot received! Associate via objectName Property and static Message counter!
     QByteArray data = Request(methodName,params).composeRequest();
 
+    QNetworkRequest request;
+    request.setUrl(d->url);
+    request.setHeader(QNetworkRequest::ContentLengthHeader, data.size());
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "text/xml");
+    request.setRawHeader("User-Agent", d->userAgent);
+    request.setRawHeader("Connection", "Keep-Alive");
+    d->accessManager->post(request, data);
+
+#ifdef XMLRPC_DEBUG
+    qDebug() << "xmlrpc request(" << id << "): " << methodName;
+    qDebug() << Variant(params).pprint();
+#endif
+    return;
+    // TODO: DELETE if valid
+/*
     QHttpRequestHeader header("POST",d->path);
     header.setContentLength( data.size() );
     header.setContentType("text/xml");
@@ -195,12 +221,9 @@ int Client::request( QList<Variant> params, QString methodName )
     d->methodNames[id] = methodName;
     d->http->close();
 
-#ifdef XMLRPC_DEBUG
-    qDebug() << "xmlrpc request(" << id << "): " << methodName;
-    qDebug() << Variant(params).pprint();
-#endif
 
-    return id;
+
+    return id;*/
 }
 
 /**
@@ -208,7 +231,7 @@ int Client::request( QList<Variant> params, QString methodName )
  * list. This is an overloaded member function, provided for
  * convenience.
  */
-int Client::request( QString methodName )
+void Client::request( QString methodName )
 {
     QList<xmlrpc::Variant> params;
     return request( params, methodName );
@@ -219,7 +242,7 @@ int Client::request( QString methodName )
  * This is an overloaded member function, provided for
  * convenience.
  */
-int Client::request( QString methodName, Variant param1 )
+void Client::request( QString methodName, Variant param1 )
 {
     QList<xmlrpc::Variant> params;
     params << param1;
@@ -231,7 +254,7 @@ int Client::request( QString methodName, Variant param1 )
  * This is an overloaded member function, provided for
  * convenience.
  */
-int Client::request( QString methodName, Variant param1, Variant param2 )
+void Client::request( QString methodName, Variant param1, Variant param2 )
 {
     QList<xmlrpc::Variant> params;
     params << param1 << param2;
@@ -243,7 +266,7 @@ int Client::request( QString methodName, Variant param1, Variant param2 )
  * This is an overloaded member function, provided for
  * convenience.
  */
-int Client::request( QString methodName, Variant param1, Variant param2, Variant param3 )
+void Client::request( QString methodName, Variant param1, Variant param2, Variant param3 )
 {
     QList<xmlrpc::Variant> params;
     params << param1 << param2 << param3;
@@ -254,14 +277,14 @@ int Client::request( QString methodName, Variant param1, Variant param2, Variant
  * This is an overloaded member function, provided for
  * convenience.
  */
-int Client::request( QString methodName, Variant param1, Variant param2, Variant param3, Variant param4 )
+void Client::request( QString methodName, Variant param1, Variant param2, Variant param3, Variant param4 )
 {
     QList<xmlrpc::Variant> params;
     params << param1 << param2 << param3 << param4;
     return request( params, methodName );
 }
 
-void Client::requestFinished(int id, bool error)
+void Client::finished(int id, bool error)
 {
     if ( !d->serverResponses.count(id) ) {
         return;
@@ -315,7 +338,7 @@ void Client::requestFinished(int id, bool error)
         delete buffer;
 
     }
-	
+
 }
 
 

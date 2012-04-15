@@ -5,7 +5,7 @@
 #define CLIENT_H
 
 #include <qobject.h>
-#include <QHttp>
+#include <QtNetwork>
 
 #include "xmlrpc/variant.h"
 class QAuthenticator;
@@ -44,41 +44,48 @@ class Client : public QObject {
 Q_OBJECT
 public:
 	Client(QObject * parent = 0);
-	Client(const QString & hostname, quint16 port = 80, QObject * parent = 0L);
+    Client(const QString & hostname, quint16 port = 80, QObject *parent = 0L);
 
-    void setHost ( const QString & hostname, quint16 port = 80, QString path="/" );
-    void setProxy ( const QString & host, int port, 
-                    const QString & username = QString(), const QString & password = QString() );
-    void setSocket ( QTcpSocket * socket );
+    void setHost ( const QString & hostname, quint16 port = 80, QString path="/", bool useSSL = false );
+    void setProxy ( const QNetworkProxy & proxy);
     void setUser ( const QString & userName, const QString & password = QString() );
+    void setUrl( const QUrl &url);
 
     void setUserAgent( const QString & userAgent );
 
 	virtual ~Client();
 
-    int request( QList<Variant> params, QString methodName );
+    void request( QList<Variant> params, QString methodName );
 
     /* overloaded methods */
-    int request( QString methodName );
-    int request( QString methodName, Variant param1 );
-    int request( QString methodName, Variant param1, Variant param2 );
-    int request( QString methodName, Variant param1, Variant param2, Variant param3 );
-    int request( QString methodName, Variant param1, Variant param2, Variant param3, Variant param4 );
+    void request( QString methodName );
+    void request( QString methodName, Variant param1 );
+    void request( QString methodName, Variant param1, Variant param2 );
+    void request( QString methodName, Variant param1, Variant param2, Variant param3 );
+    void request( QString methodName, Variant param1, Variant param2, Variant param3, Variant param4 );
+
 
 signals:
     //! request requestId is done with return value res
     void done( int requestId, QVariant res );
+
     //! request requestId is failed with fault code faultCode and fault description faultString
     void failed( int requestId, int faultCode, QString faultString );
 
-    //! authenticationRequired signal passed from QHttp
-    void authenticationRequired ( const QString & hostname, quint16 port, QAuthenticator * );
+    //! authenticationRequired signal passed from QNetworkAccessManager
+    void authenticationRequired ( QNetworkReply * reply, QAuthenticator * );
 
-    //! proxyAuthenticationRequired signal passed from QHttp
+    //! proxyAuthenticationRequired signal passed from QNetworkAccessManager
     void proxyAuthenticationRequired(const QNetworkProxy &, QAuthenticator *);
 
+    //! networkAccessibleChanged signal passed from QNetworkAccessManager
+    void networkAccessibleChanged(QNetworkAccessManager::NetworkAccessibility accessible);
+
+    //! sslError signal passed from QNetworkAccessManager
+    void sslError(QNetworkReply * reply, const QList<QSslError> & errors);
+
 protected slots:
-    void requestFinished(int id, bool error);
+    void finished(int id, bool error);
 
 private:
 	class Private;
